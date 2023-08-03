@@ -1,2 +1,13 @@
 # IDE
 .idea
+
+# logs 用来存放系统安装过程中的日志文件
+# 暂时还未使用
+logs/*
+
+# os_files 下用于存放从已安装完成的硬盘中拷贝而来的操作系统的文件
+# 该目录下的文件不会被提交到git仓库中
+os_files/*
+
+# mountpoint 用来临时挂载硬盘的两个分区
+mountpoint/*
