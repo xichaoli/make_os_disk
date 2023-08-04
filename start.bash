@@ -73,12 +73,22 @@ function select_disk() {
     local disk_info
     disk_info=$(lsblk -d -n -o NAME,SIZE)
     local menu
-    #TODO：下面的 %-10s 没有生效，暂时不知道如何修改
+    # 下面的 %-10s 没有生效，暂时不知道如何修改
     menu=$(echo "$disk_info" | awk '{printf "%-10s %s\n", $1, $2}')
     # shellcheck disable=SC2086
     SELECTED_DISK=$(whiptail --title "选择硬盘" --menu "选择将系统安装到哪个硬盘" \
         15 60 5 ${menu} 3>&1 1>&2 2>&3)
     export SELECTED_DISK
+    # 警告,此操作会清空磁盘数据,请确认已做好数据备份
+    if (
+        whiptail --title "警告" --yesno \
+            "此操作会清空磁盘数据,请确认已做好数据备份" 15 60 3>&1 1>&2 2>&3
+    ); then
+        echo "用户确认已做好数据备份"
+    else
+        echo "用户取消安装"
+        exit 1
+    fi
 }
 
 # 判断磁盘 disk 下的分区是否已经挂载，如果已经挂载，则卸载
@@ -92,7 +102,7 @@ function umount_partition() {
     if [ -n "$mounted_partitions" ]; then
         echo "磁盘 $disk 有分区被挂载，开始卸载..."
         for partition in $mounted_partitions; do
-            umount "$partition"
+            umount -l "$partition"
         done
         echo "磁盘 $disk 分区卸载完成..."
     fi
@@ -109,7 +119,7 @@ function prepare_partition() {
     disk=/dev/"$SELECTED_DISK"
     umount_partition "$disk"
 
-    # 使用 parted 创建分区，格式化分区
+    # 使用 parted 创建分区
     echo "正在创建分区..."
     parted -s "$disk" mklabel gpt
     if [[ $BOARD_TYPE == 1 ]]; then
@@ -125,10 +135,10 @@ function prepare_partition() {
     if [[ $BOARD_TYPE == 1 ]]; then
         mkfs.vfat -F32 "${disk}1"
     elif [[ $BOARD_TYPE == 2 ]]; then
-        mkfs.ext4 -q -F "${disk}1"
+        mkfs.ext4 -q -F "${disk}1" >/dev/null
     fi
     echo "格式化第二个分区..."
-    mkfs.ext4 -q -F "${disk}2"
+    mkfs.ext4 -q -F "${disk}2" >/dev/null
     # 挂载分区
     echo "挂载分区..."
     mount "${disk}1" "$(pwd)"/mountpoint/1
@@ -139,7 +149,7 @@ function prepare_partition() {
 function copy_files() {
     if [[ $BOARD_TYPE == 1 ]]; then
         echo "拷贝EFI分区文件..."
-        rsync -aHAX -h --no-i-r --info=progress2 \
+        rsync -rtD -h --no-i-r --info=progress2 \
             "$(pwd)"/os_files/F4128/"${OS_VERSION}"/partition1/* \
             "$(pwd)"/mountpoint/1/
         echo "拷贝根分区文件..."
@@ -157,23 +167,8 @@ function copy_files() {
             "$(pwd)"/mountpoint/2/
     fi
 
+    echo "执行sync操作,时间较长,请耐心等待..."
     sync
-}
-
-# 进入chroot环境
-function into_chroot() {
-    # 挂载宿主机设备节点
-    mount -t proc /proc "$(pwd)"/mountpoint/2/proc
-    mount -t sysfs /sys "$(pwd)"/mountpoint/2/sys
-    mount -o bind /dev "$(pwd)"/mountpoint/2/dev
-    mount -o bind /dev/pts "$(pwd)"/mountpoint/2/dev/pts
-    mount -o bind /run "$(pwd)"/mountpoint/2/run
-
-    # 执行chroot，并记录日志
-    # 在x86平台chroot到arm64平台的rootfs，需要安装 qemu-user-static、binfmt-support
-    chroot "$(pwd)"/mountpoint/2 bash /usr/bin/in_chroot.bash "$(pwd)
-    "/mountpoint/2 2>&1 | sudo tee "$(pwd)
-    "/logs/os_installer_inchroot.log
 }
 
 # 解析 os_files 下的 fstab 文件, 获取各个分区的UUID及对应的挂载点,放入一个数组中
@@ -188,23 +183,47 @@ function get_old_partitions_info() {
 
     # Initialize the array
     declare -A -g old_partitions_info=()
+
+    # some local variables
     local line
     local uuid
     local mount_point
+
     # Read the fstab file line by line
     while read -r line; do
         # Skip comments and empty lines
         if [[ "$line" =~ ^#|^$ ]]; then
             continue
         fi
-
         # Extract the UUID and mount point from the line
         uuid=$(echo "$line" | awk '{print $1}' | cut -d= -f2)
         mount_point=$(echo "$line" | awk '{print $2}')
-
         # Add the UUID and mount point to the array
         old_partitions_info["$mount_point"]="$uuid"
     done <"${fstab_file}"
+
+    # 打印数组,用于调试
+    #    local key
+    #    for key in "${!old_partitions_info[@]}"; do
+    #        echo "key: $key, value: ${old_partitions_info[$key]}"
+    #    done
+}
+
+# 进入chroot环境
+function into_chroot() {
+    local disk
+    disk=/dev/"$SELECTED_DISK"
+    # 挂载宿主机设备节点
+    mount -t proc /proc "$(pwd)"/mountpoint/2/proc
+    mount -t sysfs /sys "$(pwd)"/mountpoint/2/sys
+    mount -o bind /dev "$(pwd)"/mountpoint/2/dev
+    mount -o bind /dev/pts "$(pwd)"/mountpoint/2/dev/pts
+    mount -o bind /run "$(pwd)"/mountpoint/2/run
+    # 执行chroot，并记录日志
+    # 在x86平台chroot到arm64平台的rootfs，需要安装 qemu-user-static、binfmt-support
+    chroot "$(pwd)"/mountpoint/2 \
+        /usr/bin/in_chroot.bash "${disk}1" 2>&1 |
+        tee "$(pwd)"/logs/os_installer_inchroot.log
 }
 
 # 安装 grub,修正grub.cfg
@@ -220,6 +239,7 @@ function fix_grub() {
         cp "$(pwd)"/scripts/in_chroot.bash \
             "$(pwd)"/mountpoint/2/usr/bin/in_chroot.bash
 
+        # 进入chroot环境,安装grub
         into_chroot
 
         # delete script in_chroot.bash
@@ -228,14 +248,15 @@ function fix_grub() {
         # 卸载宿主设备节点
         umount -l "$(pwd)"/mountpoint/2/dev/pts >/dev/null 2>&1
         umount -l "$(pwd)"/mountpoint/2/dev >/dev/null 2>&1
-        umount -l "$(pwd)"/mountpoint/2/run >/dev/null 2>&1
         umount -l "$(pwd)"/mountpoint/2/proc >/dev/null 2>&1
         umount -l "$(pwd)"/mountpoint/2/sys >/dev/null 2>&1
-        grub_cfg=$(find "$(pwd)"/mountpoint/2/boot/grub/ -name grub.cfg)
+        umount -l "$(pwd)"/mountpoint/2/run >/dev/null 2>&1
     elif [[ $BOARD_TYPE == 2 ]]; then
         echo "主板型号为S6040，不需要安装 grub..."
-        grub_cfg=$(find "$(pwd)"/mountpoint/1/boot/grub/ -name grub.cfg)
     fi
+
+    # 查找 grub.cfg 文件
+    grub_cfg=$(find "$(pwd)"/mountpoint/1/boot/grub/ -name grub.cfg)
 
     echo "修正 grub.cfg..."
     sed -i "s/${old_partitions_info["/"]}/$(
@@ -252,15 +273,19 @@ function fix_fstab() {
     fstab_file="$(pwd)"/mountpoint/2/etc/fstab
 
     echo "修正 fstab..."
+    # 替换根分区的UUID
     sed -i "s/${old_partitions_info["/"]}/$(
         blkid -p -s UUID -o value "${disk}2"
     )/g" "$fstab_file"
 
+    # 当主板型号是F4128时该分区挂载点为 /boot/efi;
+    # 当主板型号为S6040时, 该分区挂载点为 /boot
     if [[ $BOARD_TYPE == 1 ]]; then
         d1_mount_point="/boot/efi"
     elif [[ $BOARD_TYPE == 2 ]]; then
         d1_mount_point="/boot"
     fi
+    # 替换第一个分区的UUID
     sed -i "s/${old_partitions_info[${d1_mount_point}]}/$(
         blkid -p -s UUID -o value "${disk}1"
     )/g" "$fstab_file"
